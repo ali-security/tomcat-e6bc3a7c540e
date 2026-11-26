@@ -45,7 +45,7 @@ import org.easymock.IMocksControl;
 public class TestLoadBalancerDrainingValve {
 
     @Parameters(name = "{index}: activation[{0}], validSessionID[{1}], expectInvokeNext[{2}], enableIgnore[{3}], " +
-            "leadingSlashes[{4}], queryString[{5}]]")
+            "leadingSlashes[{4}], queryString[{5}], sessionUriParam[{8}]]")
     public static Collection<Object[]> parameters() {
 
         String[] jkActivations = new String[] { "ACT", "DIS" };
@@ -63,9 +63,11 @@ public class TestLoadBalancerDrainingValve {
                         for (String queryString : queryStrings) {
                             for (Boolean secureRequest : booleans) {
                                 for (Boolean secureSessionConfig : booleans) {
-                                    parameterSets.add(new Object[] { jkActivation, validSessionId, expectInvokeNext,
-                                            enableIgnore, leadingSlashes, queryString, secureRequest,
-                                            secureSessionConfig });
+                                    for (Boolean sessionUriParam : booleans) {
+                                        parameterSets.add(new Object[] { jkActivation, validSessionId,
+                                                expectInvokeNext, enableIgnore, leadingSlashes, queryString,
+                                                secureRequest, secureSessionConfig, sessionUriParam });
+                                    }
                                 }
                             }
                         }
@@ -100,6 +102,9 @@ public class TestLoadBalancerDrainingValve {
 
     @Parameter(7)
     public boolean secureSessionConfig;
+
+    @Parameter(8)
+    public boolean sessionUriParam;
 
 
     @Test
@@ -146,8 +151,17 @@ public class TestLoadBalancerDrainingValve {
 
             cookies.add(cookie);
 
+            // A ;jsessionid path parameter between the leading slashes and the
+            // rest of the path must not result in a protocol-relative redirect
+            // (e.g. "/;jsessionid=x/test/path" must not redirect to "//test/path")
+            String pathParameter = "";
+            if (sessionUriParam) {
+                pathParameter = ";" + sessionCookieName + "=" + sessionId;
+            }
+
             EasyMock.expect(request.getRequestedSessionId()).andStubReturn(sessionId);
-            EasyMock.expect(request.getRequestURI()).andStubReturn("/".repeat(leadingSlashes.intValue()) + requestURI);
+            EasyMock.expect(request.getRequestURI())
+                    .andStubReturn("/".repeat(leadingSlashes.intValue()) + pathParameter + requestURI);
             EasyMock.expect(request.getCookies()).andStubReturn(cookies.toArray(new Cookie[0]));
             EasyMock.expect(request.getContext()).andStubReturn(ctx);
             EasyMock.expect(ctx.getSessionCookieName()).andStubReturn(sessionCookieName);
