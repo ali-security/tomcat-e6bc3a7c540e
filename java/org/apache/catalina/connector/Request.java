@@ -419,6 +419,11 @@ public class Request implements HttpServletRequest {
      */
     protected Boolean asyncSupported = null;
 
+    /**
+     * Has HttpServletRequest.upgrade() been called for this request?
+     */
+    private boolean upgradeRequested = false;
+
     private HttpServletRequest applicationRequest = null;
 
     /**
@@ -552,6 +557,7 @@ public class Request implements HttpServletRequest {
         }
 
         asyncSupported = null;
+        upgradeRequested = false;
         if (asyncContext != null) {
             asyncContext.recycle();
             asyncContext = null;
@@ -1631,6 +1637,10 @@ public class Request implements HttpServletRequest {
             throw ise;
         }
 
+        if (upgradeRequested) {
+            throw new IllegalStateException(sm.getString("coyoteRequest.asyncAfterUpgrade"));
+        }
+
         if (asyncContext == null) {
             asyncContext = new AsyncContextImpl(this);
         }
@@ -1674,6 +1684,16 @@ public class Request implements HttpServletRequest {
         }
 
         return asyncContext.isStarted();
+    }
+
+    private boolean isAsyncError() {
+        if (asyncContext == null) {
+            return false;
+        }
+
+        AtomicBoolean result = new AtomicBoolean(false);
+        coyoteRequest.action(ActionCode.ASYNC_IS_ERROR, result);
+        return result.get();
     }
 
     /**
@@ -2001,6 +2021,25 @@ public class Request implements HttpServletRequest {
     @Override
     public <T extends HttpUpgradeHandler> T upgrade(Class<T> httpUpgradeHandlerClass)
             throws IOException, ServletException {
+        if (upgradeRequested) {
+            throw new IllegalStateException(sm.getString("coyoteRequest.upgradeAfterUpgrade"));
+        }
+        /*
+         * Upgrade is permitted while asynchronous processing is in progress. The upgrade completes the asynchronous
+         * processing so it must be called before the application calls AsyncContext.complete() or
+         * AsyncContext.dispatch().
+         */
+        if (isAsyncCompleting() || isAsyncDispatching()) {
+            throw new IllegalStateException(sm.getString("coyoteRequest.upgradeAfterAsyncEnd"));
+        }
+        // An error has occurred (e.g. AsyncListener.onError() is being called) so upgrading is no longer appropriate
+        if (isAsyncError()) {
+            throw new IllegalStateException(sm.getString("coyoteRequest.upgradeAfterAsyncError"));
+        }
+        if (response.isCommitted()) {
+            throw new IllegalStateException(sm.getString("coyoteRequest.upgradeAfterCommit"));
+        }
+
         T handler;
         InstanceManager instanceManager = null;
         try {
@@ -2015,16 +2054,37 @@ public class Request implements HttpServletRequest {
         } catch (ReflectiveOperationException | NamingException | IllegalArgumentException | SecurityException e) {
             throw new ServletException(e);
         }
-        UpgradeToken upgradeToken = new UpgradeToken(handler, getContext(), instanceManager,
-                getUpgradeProtocolName(httpUpgradeHandlerClass));
+        try {
+            UpgradeToken upgradeToken = new UpgradeToken(handler, getContext(), instanceManager,
+                    getUpgradeProtocolName(httpUpgradeHandlerClass));
 
-        coyoteRequest.action(ActionCode.UPGRADE, upgradeToken);
+            // This will fail if the protocol does not support HTTP upgrade
+            coyoteRequest.action(ActionCode.UPGRADE, upgradeToken);
+        } catch (Throwable t) {
+            ExceptionUtils.handleThrowable(t);
+            // The handler has been created but nothing will use it so it needs to be destroyed
+            destroyUpgradeHandler(instanceManager, handler);
+            throw t;
+        }
+        upgradeRequested = true;
 
         // Output required by RFC2616. Protocol specific headers should have
         // already been set.
         response.setStatus(HttpServletResponse.SC_SWITCHING_PROTOCOLS);
 
         return handler;
+    }
+
+
+    private void destroyUpgradeHandler(InstanceManager instanceManager, HttpUpgradeHandler handler) {
+        if (instanceManager != null) {
+            try {
+                instanceManager.destroyInstance(handler);
+            } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
+                log.warn(sm.getString("coyoteRequest.upgradeHandlerDestroyFail"), t);
+            }
+        }
     }
 
 
@@ -2043,9 +2103,15 @@ public class Request implements HttpServletRequest {
         }
 
         if (result == null) {
-            // Ugly but use the class name - it is better than nothing
+            /*
+             * Use the class name temporarily. It will be replaced at the end of Servlet.service() by the upgrade header
+             * field value.
+             */
             result = httpUpgradeHandlerClass.getName();
+        } else {
+            result = result.trim();
         }
+
         return result;
     }
 

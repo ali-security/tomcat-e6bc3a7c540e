@@ -501,6 +501,48 @@ public class Http11Processor extends AbstractProcessor {
     }
 
 
+    private boolean validateUpgradeToken() {
+        // Can't upgrade in an error state
+        if (getErrorState().isError()) {
+            return false;
+        }
+        // Make sure the application hasn't changed the status
+        if (response.getStatus() != HttpServletResponse.SC_SWITCHING_PROTOCOLS) {
+            return false;
+        }
+        // Make sure the application has set the Upgrade header
+        String upgrade = response.getMimeHeaders().getHeader("upgrade");
+        if (upgrade == null) {
+            return false;
+        } else {
+            upgrade = upgrade.trim();
+        }
+
+        if (!upgradeToken.getProtocol().equalsIgnoreCase(upgrade)) {
+            // The application set/updated the upgrade protocol name. Update the token.
+            upgradeToken = new UpgradeToken(upgradeToken.getHttpUpgradeHandler(), upgradeToken.getContextBind(),
+                    upgradeToken.getInstanceManager(), upgrade);
+        }
+        return true;
+    }
+
+
+    private void cleanUpgradeToken() {
+        if (upgradeToken.getInstanceManager() != null) {
+            ClassLoader oldCL = upgradeToken.getContextBind().bind(false, null);
+            try {
+                upgradeToken.getInstanceManager().destroyInstance(upgradeToken.getHttpUpgradeHandler());
+            } catch (Throwable t) {
+                ExceptionUtils.handleThrowable(t);
+                log.warn(sm.getString("http11processor.upgrade.clean.fail"), t);
+            } finally {
+                upgradeToken.getContextBind().unbind(false, oldCL);
+            }
+        }
+        upgradeToken = null;
+    }
+
+
     @Override
     protected final void setSocketWrapper(SocketWrapperBase<?> socketWrapper) {
         super.setSocketWrapper(socketWrapper);
@@ -1026,8 +1068,12 @@ public class Http11Processor extends AbstractProcessor {
             keepAlive = false;
         }
         if (!keepAlive) {
-            // Avoid adding the close header twice
-            if (!connectionClosePresent) {
+            /*
+             * Avoid adding the close header twice. Do not add it to a response that switches protocols. The connection
+             * is not going to be closed, it is going to be used for the new protocol and the Connection header that is
+             * required for the protocol switch is already present.
+             */
+            if (!connectionClosePresent && statusCode != HttpServletResponse.SC_SWITCHING_PROTOCOLS) {
                 headers.addValue(Constants.CONNECTION).setString(Constants.CLOSE);
             }
         } else if (!getErrorState().isError()) {
@@ -1072,6 +1118,23 @@ public class Http11Processor extends AbstractProcessor {
         } else {
             // server always overrides anything the app might set
             headers.setValue("Server").setString(server);
+        }
+
+        if (upgradeToken != null && !validateUpgradeToken()) {
+            /*
+             * doHttpUpgrade() stopped further HTTP output. The upgrade has failed so the HTTP response must be
+             * completed.
+             */
+            outputBuffer.responseFinished = false;
+            cleanUpgradeToken();
+            // Don't overwrite any existing error
+            if (!getErrorState().isError()) {
+                setErrorState(ErrorState.CLOSE_CLEAN, null);
+            }
+            if (!keepAlive && !isConnectionToken(headers, Constants.CLOSE)) {
+                // The close header was not added above because the response was expected to be a protocol switch
+                headers.addValue(Constants.CONNECTION).setString(Constants.CLOSE);
+            }
         }
 
         writeHeaders(response.getStatus(), headers);
@@ -1180,6 +1243,26 @@ public class Http11Processor extends AbstractProcessor {
 
     @Override
     protected SocketState dispatchEndRequest() {
+        if (isUpgrade()) {
+            if (protocol.isPaused()) {
+                /*
+                 * As when the upgrade is requested outside of asynchronous processing, the connection is closed rather
+                 * than upgraded if the protocol is paused. The HttpUpgradeHandler is destroyed as part of closing the
+                 * connection.
+                 */
+                return SocketState.CLOSED;
+            }
+            /*
+             * The upgrade was requested during asynchronous processing. Whether keep-alive is enabled is irrelevant as
+             * the connection is being handed over to the upgrade processor, as it is when the upgrade is requested
+             * outside of asynchronous processing. Finish the request so any unread request body is swallowed and any
+             * pipelined (or upgraded protocol) data is retained as leftover input.
+             */
+            endRequest();
+            inputBuffer.nextRequest();
+            outputBuffer.nextRequest();
+            return SocketState.UPGRADING;
+        }
         if (!keepAlive || protocol.isPaused()) {
             return SocketState.CLOSED;
         } else {
