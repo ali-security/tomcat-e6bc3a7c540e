@@ -1905,6 +1905,68 @@ public class TestAsyncContextImpl extends TomcatBaseTest {
         }
     }
 
+
+    /*
+     * The Servlet calls startAsync() and then throws an exception before service() exits. The AsyncListener does not
+     * call complete() or dispatch() from onError() so the container must perform the error handling and complete the
+     * request. Previously the async state machine was left in MUST_ERROR which triggered an IllegalStateException in
+     * asyncPostProcess(), no response was sent and onComplete() was never fired.
+     */
+    @Test
+    public void testAsyncStartThenErrorNoCompleteOnError() throws Exception {
+        resetTracker();
+        Tomcat tomcat = getTomcatInstance();
+
+        Context ctx = getProgrammaticRootContext();
+        AsyncStartThenErrorServlet servlet = new AsyncStartThenErrorServlet();
+        Wrapper w = Tomcat.addServlet(ctx, "async", servlet);
+        w.setAsyncSupported(true);
+        ctx.addServletMappingDecoded("/async", "async");
+
+        TesterAccessLogValve alv = new TesterAccessLogValve();
+        ctx.getPipeline().addValve(alv);
+
+        tomcat.start();
+
+        ByteChunk bc = new ByteChunk();
+        int rc = getUrl("http://localhost:" + getPort() + "/async", bc, null);
+
+        Assert.assertEquals(HttpServletResponse.SC_INTERNAL_SERVER_ERROR, rc);
+
+        String expectedTrack = "doGet-onError-onComplete-";
+        // Wait up to 5s for the listeners to fire
+        int count = 0;
+        while (!expectedTrack.equals(getTrack()) && count < 100) {
+            Thread.sleep(50);
+            count++;
+        }
+        Assert.assertEquals(expectedTrack, getTrack());
+        Assert.assertTrue(servlet.isAsyncStartedCorrect());
+
+        // Check the access log
+        alv.validateAccessLog(1, HttpServletResponse.SC_INTERNAL_SERVER_ERROR, 0, REQUEST_TIME);
+    }
+
+
+    private static class AsyncStartThenErrorServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        private final transient TrackingListener trackingListener = new TrackingListener(false, false, null);
+
+        @Override
+        protected void doGet(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+            track("doGet-");
+            AsyncContext ctx = req.startAsync();
+            ctx.addListener(trackingListener);
+            throw new ServletException();
+        }
+
+        public boolean isAsyncStartedCorrect() {
+            return trackingListener.isAsyncStartedCorrect();
+        }
+    }
+
     @Test
     public void testForbiddenDispatching() throws Exception {
         resetTracker();
@@ -3102,6 +3164,109 @@ public class TestAsyncContextImpl extends TomcatBaseTest {
                 // Ignore
             } finally {
                 threadCompleteLatch.countDown();
+            }
+        }
+    }
+
+
+    /*
+     * Tests an I/O error reading the request body on an async thread before the Servlet's service() method exits where
+     * the AsyncListener does not call complete() or dispatch() from onError(). The container must complete the async
+     * request (and fire onComplete()) rather than leaving the async state machine in MUST_ERROR which previously
+     * triggered an IllegalStateException in asyncPostProcess().
+     *
+     * Required sequence is: - enter Servlet's service() method - startAsync() - start async thread - read partial body
+     * - close client connection - read on async thread -> I/O error - exit Servlet's service() method
+     */
+    @Test
+    public void testCanceledPostNoCompleteOnError() throws Exception {
+        resetTracker();
+        CountDownLatch partialReadLatch = new CountDownLatch(1);
+        CountDownLatch clientCloseLatch = new CountDownLatch(1);
+        CountDownLatch threadCompleteLatch = new CountDownLatch(1);
+
+        AtomicBoolean testFailed = new AtomicBoolean(true);
+
+        // Setup Tomcat instance
+        Tomcat tomcat = getTomcatInstance();
+
+        // No file system docBase required
+        Context ctx = getProgrammaticRootContext();
+
+        PostListenerServlet postServlet =
+                new PostListenerServlet(partialReadLatch, clientCloseLatch, threadCompleteLatch, testFailed);
+        Wrapper wrapper = Tomcat.addServlet(ctx, "postServlet", postServlet);
+        wrapper.setAsyncSupported(true);
+        ctx.addServletMappingDecoded("/*", "postServlet");
+
+        tomcat.start();
+
+        PostClient client = new PostClient();
+        client.setPort(getPort());
+        // @formatter:off
+        client.setRequest(new String[] {
+                "POST / HTTP/1.1" + CRLF +
+                "Host: localhost:" + CRLF +
+                "Content-Length: 100" + CRLF +
+                CRLF +
+                "This is 16 bytes"
+                });
+        // @formatter:on
+        client.connect();
+        client.sendRequest();
+
+        // Wait server to read partial request body
+        partialReadLatch.await();
+
+        client.disconnect();
+
+        clientCloseLatch.countDown();
+
+        threadCompleteLatch.await();
+
+        // The read on the async thread must have triggered an I/O error
+        Assert.assertFalse(testFailed.get());
+
+        String expectedTrack = "onError-onComplete-";
+        // Wait up to 5s for the listeners to fire
+        int count = 0;
+        while (!expectedTrack.equals(getTrack()) && count < 100) {
+            Thread.sleep(50);
+            count++;
+        }
+        Assert.assertEquals(expectedTrack, getTrack());
+    }
+
+
+    private static final class PostListenerServlet extends HttpServlet {
+
+        private static final long serialVersionUID = 1L;
+
+        private final transient CountDownLatch partialReadLatch;
+        private final transient CountDownLatch clientCloseLatch;
+        private final transient CountDownLatch threadCompleteLatch;
+        private final AtomicBoolean testFailed;
+
+        PostListenerServlet(CountDownLatch partialReadLatch, CountDownLatch clientCloseLatch,
+                CountDownLatch threadCompleteLatch, AtomicBoolean testFailed) {
+            this.partialReadLatch = partialReadLatch;
+            this.clientCloseLatch = clientCloseLatch;
+            this.threadCompleteLatch = threadCompleteLatch;
+            this.testFailed = testFailed;
+        }
+
+        @Override
+        protected void doPost(HttpServletRequest req, HttpServletResponse resp) throws ServletException, IOException {
+
+            AsyncContext ac = req.startAsync();
+            ac.addListener(new TrackingListener(false, false, null));
+            Thread t = new PostServletThread(ac, partialReadLatch, clientCloseLatch, threadCompleteLatch, testFailed);
+            t.start();
+
+            try {
+                threadCompleteLatch.await();
+            } catch (InterruptedException e) {
+                // Ignore
             }
         }
     }
